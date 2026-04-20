@@ -1,0 +1,44 @@
+seed: 42
+device: cuda
+num_workers: 4
+save_dir: outputs/ccnet_base
+
+dataset:
+  train_root: data/train
+  val_root: data/val
+  test_root: data/test
+  image_size: 256
+  in_channels: 3
+  image_suffix: .png
+  mask_suffix: .png
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+model:
+  in_channels: 3
+  base_channels: 32
+
+loss:
+  lambda_sep: 0.3
+  lambda_sim: 0.3
+  lambda_rst: 0.1
+  tversky_alpha: 0.8
+  tversky_beta: 0.2
+  tversky_weight: 1.0
+
+optim:
+  epochs: 50
+  batch_size: 4
+  lr: 0.0003
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  amp: true
+  grad_clip: 5.0
+  log_interval: 10
+
+scheduler:
+  min_lr: 0.000001
+
+inference:
+  threshold: 0.75
