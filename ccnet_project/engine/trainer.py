@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 import torch
 from torch.amp import GradScaler, autocast
@@ -24,6 +24,11 @@ class Trainer:
         cfg: Dict,
         logger,
         device: torch.device,
+        start_epoch: int = 0,
+        best_f1: float = -1.0,
+        optimizer_state: Dict[str, Any] | None = None,
+        scheduler_state: Dict[str, Any] | None = None,
+        override_lr: float | None = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -51,6 +56,17 @@ class Trainer:
             T_max=cfg["optim"]["epochs"],
             eta_min=cfg["scheduler"]["min_lr"],
         )
+        if optimizer_state is not None:
+            self.optimizer.load_state_dict(optimizer_state)
+        if scheduler_state is not None:
+            self.scheduler.load_state_dict(scheduler_state)
+            self.scheduler.T_max = cfg["optim"]["epochs"]
+        if override_lr is not None:
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = override_lr
+                param_group["initial_lr"] = override_lr
+            self.scheduler.base_lrs = [override_lr for _ in self.scheduler.base_lrs]
+            self.scheduler._last_lr = [override_lr for _ in self.scheduler._last_lr]
         self.scaler = GradScaler(enabled=cfg["optim"]["amp"] and device.type == "cuda")
         self.evaluator = Evaluator(
             model=self.model,
@@ -58,13 +74,14 @@ class Trainer:
             device=device,
             threshold=cfg["inference"].get("threshold", 0.75),
         )
-        self.best_f1 = -1.0
+        self.start_epoch = int(start_epoch)
+        self.best_f1 = float(best_f1)
 
     def train(self) -> None:
         save_dir = Path(self.cfg["save_dir"])
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        for epoch in range(1, self.cfg["optim"]["epochs"] + 1):
+        for epoch in range(self.start_epoch + 1, self.cfg["optim"]["epochs"] + 1):
             train_stats = self.train_one_epoch(epoch)
             val_stats = self.evaluator.evaluate(self.val_loader)
             self.scheduler.step()
