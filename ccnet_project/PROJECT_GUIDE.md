@@ -1026,3 +1026,109 @@ python models/ccnet.py
 ---
 
 这份文档对应的是当前工作区内的实际实现版本。如果后续你继续修改模型结构，建议同步更新本文件，避免“代码和说明脱节”。
+
+---
+
+## 16. 继续训练与训练集划分验证集
+
+### 16.1 继续训练
+
+继续训练入口文件是 `continue_train.py`。它会从已有 checkpoint 中加载模型权重，并在默认情况下恢复 optimizer、scheduler、epoch 和 `best_f1`。
+
+基础用法：
+
+```bash
+python continue_train.py --config configs/ccnet_base.yaml --checkpoint outputs/ccnet_base/latest.pth --epochs 51
+```
+
+常用参数：
+
+- `--checkpoint`：要加载的 checkpoint，例如 `outputs/ccnet_base/latest.pth` 或 `outputs/ccnet_base/best_f1.pth`
+- `--epochs`：继续训练后的总 epoch 数，不是额外追加轮数
+- `--lr`：覆盖配置文件和 checkpoint 中的学习率
+- `--batch_size`：覆盖配置文件中的 batch size
+- `--save_dir`：覆盖 checkpoint 输出目录
+- `--weights_only`：只加载模型权重，重新初始化 optimizer 和 scheduler
+
+示例：
+
+```bash
+python continue_train.py --config configs/ccnet_base.yaml --checkpoint outputs/ccnet_base/latest.pth --epochs 80 --lr 0.0001 --save_dir outputs/continue_train
+```
+
+只加载模型权重并重新初始化训练状态：
+
+```bash
+python continue_train.py --config configs/ccnet_base.yaml --checkpoint outputs/ccnet_base/best_f1.pth --weights_only --epochs 50 --lr 0.0001
+```
+
+### 16.2 新数据集没有验证集时的处理
+
+项目支持从训练集中自动划分一部分样本作为验证集。配置项位于 `dataset` 下：
+
+```yaml
+dataset:
+  train_root: data/train
+  val_root: data/val
+  use_train_val_split: false
+  val_split: 0.2
+```
+
+规则：
+
+- 如果 `val_root` 存在，并且 `use_train_val_split: false`，会使用独立验证集。
+- 如果 `val_root` 不存在，会自动从 `train_root` 中划分验证集。
+- 如果设置 `use_train_val_split: true`，即使 `val_root` 存在，也会强制从 `train_root` 中划分验证集。
+- `val_split: 0.2` 表示 20% 样本作为验证集，80% 样本用于训练。
+- 划分使用配置中的 `seed`，因此同一个 seed 下划分结果可复现。
+
+继续训练时也可以直接通过命令行指定：
+
+```bash
+python continue_train.py --config configs/ccnet_base.yaml --checkpoint outputs/ccnet_base/latest.pth --use_train_val_split --val_split 0.2
+```
+
+如果你的新数据集只有训练目录，例如：
+
+```text
+new_data/train/
+├── t1/
+├── t2/
+└── mask/
+```
+
+可以在 config 中这样设置：
+
+```yaml
+dataset:
+  train_root: new_data/train
+  val_root: new_data/val
+  use_train_val_split: true
+  val_split: 0.2
+```
+
+然后运行：
+
+```bash
+python continue_train.py --config configs/ccnet_base.yaml --checkpoint outputs/ccnet_base/latest.pth --epochs 80 --lr 0.0001
+```
+
+### 16.3 更新后的常用命令
+
+从零训练：
+
+```bash
+python train.py --config configs/ccnet_base.yaml
+```
+
+继续训练：
+
+```bash
+python continue_train.py --config configs/ccnet_base.yaml --checkpoint outputs/ccnet_base/latest.pth --epochs 80
+```
+
+继续训练并从训练集划分验证集：
+
+```bash
+python continue_train.py --config configs/ccnet_base.yaml --checkpoint outputs/ccnet_base/latest.pth --epochs 80 --use_train_val_split --val_split 0.2
+```

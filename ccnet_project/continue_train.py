@@ -4,7 +4,7 @@ import torch
 
 from engine.trainer import Trainer
 from models.ccnet import CCNet
-from train import build_dataloader
+from train import build_train_val_dataloaders
 from utils.checkpoint import load_checkpoint
 from utils.logger import setup_logger
 from utils.misc import load_yaml
@@ -22,6 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None, help="Total epochs after resuming")
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch size")
     parser.add_argument("--save_dir", type=str, default=None, help="Override checkpoint output directory")
+    parser.add_argument("--val_split", type=float, default=None, help="Validation ratio when val_root is missing")
+    parser.add_argument(
+        "--use_train_val_split",
+        action="store_true",
+        help="Force validation split from train_root even when val_root exists",
+    )
     parser.add_argument(
         "--weights_only",
         action="store_true",
@@ -39,6 +45,10 @@ def apply_overrides(cfg: dict, args: argparse.Namespace) -> dict:
         cfg["optim"]["batch_size"] = args.batch_size
     if args.save_dir is not None:
         cfg["save_dir"] = args.save_dir
+    if args.val_split is not None:
+        cfg["dataset"]["val_split"] = args.val_split
+    if args.use_train_val_split:
+        cfg["dataset"]["use_train_val_split"] = True
     return cfg
 
 
@@ -54,8 +64,7 @@ def main() -> None:
 
     checkpoint = load_checkpoint(args.checkpoint, map_location=device)
 
-    train_loader = build_dataloader(cfg, split="train", is_train=True)
-    val_loader = build_dataloader(cfg, split="val", is_train=False)
+    train_loader, val_loader = build_train_val_dataloaders(cfg)
 
     model = CCNet(
         in_channels=cfg["model"]["in_channels"],

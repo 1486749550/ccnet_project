@@ -7,6 +7,8 @@ dataset:
   train_root: data/train
   val_root: data/val
   test_root: data/test
+  use_train_val_split: false
+  val_split: 0.2
   image_size: 256
   in_channels: 3
   image_suffix: .png
