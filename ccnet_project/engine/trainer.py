@@ -51,7 +51,7 @@ class Trainer:
             T_max=cfg["optim"]["epochs"],
             eta_min=cfg["scheduler"]["min_lr"],
         )
-        self.scaler = GradScaler(enabled=cfg["optim"]["amp"] and device.type == "cuda")
+        self.scaler = GradScaler(enabled=cfg["optim"]["amp"] and device.type == "cuda", init_scale=256.0)
         self.evaluator = Evaluator(
             model=self.model,
             criterion=self.criterion,
