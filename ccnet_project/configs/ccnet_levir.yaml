@@ -41,4 +41,11 @@ scheduler:
   min_lr: 0.000001
 
 inference:
-  threshold: 0.75
+  threshold: 0.5
+
+
+# python ./ccnet_project/train.py --config ./ccnet_project/configs/ccnet_levir.yaml
+
+# python ./ccnet_project/validate.py --config ./ccnet_project/configs/ccnet_levir.yaml --checkpoint outputs/ccnet_levir/best_f1.pth
+
+# python ./ccnet_project/infer.py --config ./ccnet_project/configs/ccnet_levir.yaml --checkpoint outputs/ccnet_levir/best_f1.pth --save_dir outputs/levir/infer

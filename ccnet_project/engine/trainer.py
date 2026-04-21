@@ -56,6 +56,7 @@ class Trainer:
             T_max=cfg["optim"]["epochs"],
             eta_min=cfg["scheduler"]["min_lr"],
         )
+<<<<<<< HEAD
         if optimizer_state is not None:
             self.optimizer.load_state_dict(optimizer_state)
         if scheduler_state is not None:
@@ -68,6 +69,9 @@ class Trainer:
             self.scheduler.base_lrs = [override_lr for _ in self.scheduler.base_lrs]
             self.scheduler._last_lr = [override_lr for _ in self.scheduler._last_lr]
         self.scaler = GradScaler(enabled=cfg["optim"]["amp"] and device.type == "cuda")
+=======
+        self.scaler = GradScaler(enabled=cfg["optim"]["amp"] and device.type == "cuda", init_scale=256.0)
+>>>>>>> 3052877b3738b0b0ae7deb2d03d5ecec00b5ae6c
         self.evaluator = Evaluator(
             model=self.model,
             criterion=self.criterion,
