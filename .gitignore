@@ -2,7 +2,7 @@
 /BaiduPCS-Go-v4.0.1-linux-amd64
 /data
 /outputs
-/ccnet_project/__pycache__/*.pyc *.pyo
-
-
+/ccnet_project/__pycache__/
+*.pyc 
+*.pyo
 /德州庆云县

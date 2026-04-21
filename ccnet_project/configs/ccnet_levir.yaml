@@ -25,8 +25,8 @@ loss:
   lambda_sep: 0.3
   lambda_sim: 0.3
   lambda_rst: 0.1
-  tversky_alpha: 0.8
-  tversky_beta: 0.2
+  tversky_alpha: 0.7
+  tversky_beta: 0.3
   tversky_weight: 1.0
 
 optim:
