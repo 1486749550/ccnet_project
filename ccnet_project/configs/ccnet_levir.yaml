@@ -11,8 +11,8 @@ dataset:
   val_split: 0.2
   image_size: 256
   in_channels: 3
-  image_suffix: .png
-  mask_suffix: .png
+  image_suffix: [.png, .jpg, .jpeg, .tif, .tiff]
+  mask_suffix: [.png, .jpg, .jpeg, .tif, .tiff]
   normalize:
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
