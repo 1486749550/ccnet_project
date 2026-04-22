@@ -2,10 +2,12 @@ import argparse
 import csv
 import json
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
+import tifffile
 from PIL import Image, ImageDraw, ImageFont
 
 try:
@@ -13,15 +15,100 @@ try:
 except ImportError:
     cv2 = None
 
+try:
+    import geopandas as gpd
+    from shapely.geometry import Polygon
+except ImportError:
+    gpd = None
+    Polygon = None
+
 
 BoxRecord = Dict[str, float | int | str]
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+GEOTIFF_SUFFIXES = (".tif", ".tiff")
+
+
+@dataclass(frozen=True)
+class GeoTransform:
+    origin_x: float
+    origin_y: float
+    pixel_width: float
+    pixel_height: float
+    tie_col: float = 0.0
+    tie_row: float = 0.0
+    matrix: Tuple[float, ...] | None = None
+
+    def pixel_to_map(self, col: float, row: float) -> Tuple[float, float]:
+        if self.matrix is not None:
+            m = self.matrix
+            x = m[0] * col + m[1] * row + m[3]
+            y = m[4] * col + m[5] * row + m[7]
+            return float(x), float(y)
+
+        x = self.origin_x + (col - self.tie_col) * self.pixel_width
+        y = self.origin_y - (row - self.tie_row) * self.pixel_height
+        return float(x), float(y)
 
 
 def read_grayscale(path: Path) -> np.ndarray:
     image = np.array(Image.open(path).convert("L"))
     assert image.ndim == 2, f"Expected grayscale image, got shape {image.shape}: {path}"
     return image
+
+
+def read_geotiff_metadata(path: Path) -> Tuple[GeoTransform, str | None, Tuple[int, int]]:
+    with tifffile.TiffFile(path) as tif:
+        page = tif.pages[0]
+        tags = page.tags
+        image_height = int(page.imagelength)
+        image_width = int(page.imagewidth)
+
+        matrix_tag = tags.get("ModelTransformationTag")
+        if matrix_tag is not None:
+            matrix = tuple(float(value) for value in matrix_tag.value)
+            assert len(matrix) == 16, f"Invalid ModelTransformationTag in {path}"
+            transform = GeoTransform(0.0, 0.0, 1.0, 1.0, matrix=matrix)
+        else:
+            scale_tag = tags.get("ModelPixelScaleTag")
+            tiepoint_tag = tags.get("ModelTiepointTag")
+            assert scale_tag is not None, f"Missing ModelPixelScaleTag in GeoTIFF: {path}"
+            assert tiepoint_tag is not None, f"Missing ModelTiepointTag in GeoTIFF: {path}"
+
+            scale = tuple(float(value) for value in scale_tag.value)
+            tiepoint = tuple(float(value) for value in tiepoint_tag.value)
+            assert len(scale) >= 2, f"Invalid ModelPixelScaleTag in {path}"
+            assert len(tiepoint) >= 6, f"Invalid ModelTiepointTag in {path}"
+
+            transform = GeoTransform(
+                origin_x=tiepoint[3],
+                origin_y=tiepoint[4],
+                pixel_width=abs(scale[0]),
+                pixel_height=abs(scale[1]),
+                tie_col=tiepoint[0],
+                tie_row=tiepoint[1],
+            )
+
+        epsg = read_epsg_from_geokeys(tags)
+        return transform, epsg, (image_height, image_width)
+
+
+def read_epsg_from_geokeys(tags) -> str | None:
+    geokey_tag = tags.get("GeoKeyDirectoryTag")
+    if geokey_tag is None:
+        return None
+
+    values = tuple(int(value) for value in geokey_tag.value)
+    if len(values) < 4:
+        return None
+
+    key_count = values[3]
+    entries = values[4 : 4 + key_count * 4]
+    epsg_keys = {3072, 2048}
+    for offset in range(0, len(entries), 4):
+        key_id, tiff_tag_location, count, value_offset = entries[offset : offset + 4]
+        if key_id in epsg_keys and tiff_tag_location == 0 and count == 1 and value_offset > 0:
+            return f"EPSG:{value_offset}"
+    return None
 
 
 def connected_components(mask: np.ndarray) -> List[np.ndarray]:
@@ -188,6 +275,17 @@ def find_image_by_stem(image_dir: Path, stem: str) -> Path:
     return matches[0]
 
 
+def find_geotiff_by_stem(tile_image_dir: Path, stem: str) -> Path:
+    matches = [
+        path
+        for path in tile_image_dir.iterdir()
+        if path.is_file() and path.stem == stem and path.suffix.lower() in GEOTIFF_SUFFIXES
+    ]
+    assert matches, f"Missing GeoTIFF tile for stem '{stem}' in {tile_image_dir}"
+    assert len(matches) == 1, f"Multiple GeoTIFF tiles found for stem '{stem}': {matches}"
+    return matches[0]
+
+
 def scale_box_to_image(box: BoxRecord, pred_size: Tuple[int, int], image_size: Tuple[int, int]) -> Tuple[int, int, int, int]:
     pred_width, pred_height = pred_size
     image_width, image_height = image_size
@@ -202,6 +300,81 @@ def scale_box_to_image(box: BoxRecord, pred_size: Tuple[int, int], image_size: T
     x_max = max(0, min(image_width - 1, x_max))
     y_max = max(0, min(image_height - 1, y_max))
     return x_min, y_min, x_max, y_max
+
+
+def scale_box_edges(box: BoxRecord, pred_size: Tuple[int, int], image_size: Tuple[int, int]) -> Tuple[float, float, float, float]:
+    pred_width, pred_height = pred_size
+    image_width, image_height = image_size
+    scale_x = image_width / pred_width
+    scale_y = image_height / pred_height
+    x_min = float(box["x_min"]) * scale_x
+    y_min = float(box["y_min"]) * scale_y
+    x_max = (float(box["x_max"]) + 1.0) * scale_x
+    y_max = (float(box["y_max"]) + 1.0) * scale_y
+    return x_min, y_min, x_max, y_max
+
+
+def box_to_geojson_feature(
+    box: BoxRecord,
+    pred_shape: Tuple[int, int],
+    tile_shape: Tuple[int, int],
+    transform: GeoTransform,
+    tile_path: Path,
+) -> Dict[str, object]:
+    pred_height, pred_width = pred_shape
+    tile_height, tile_width = tile_shape
+    x_min, y_min, x_max, y_max = scale_box_edges(box, (pred_width, pred_height), (tile_width, tile_height))
+
+    top_left = transform.pixel_to_map(x_min, y_min)
+    top_right = transform.pixel_to_map(x_max, y_min)
+    bottom_right = transform.pixel_to_map(x_max, y_max)
+    bottom_left = transform.pixel_to_map(x_min, y_max)
+    ring = [top_left, top_right, bottom_right, bottom_left, top_left]
+
+    properties = dict(box)
+    properties["tile"] = tile_path.name
+    properties["geo_x_min"] = min(point[0] for point in ring[:-1])
+    properties["geo_y_min"] = min(point[1] for point in ring[:-1])
+    properties["geo_x_max"] = max(point[0] for point in ring[:-1])
+    properties["geo_y_max"] = max(point[1] for point in ring[:-1])
+
+    return {
+        "type": "Feature",
+        "properties": properties,
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[list(point) for point in ring]],
+        },
+    }
+
+
+def save_geojson(features: List[Dict[str, object]], save_path: Path, crs: str | None = None) -> None:
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    collection: Dict[str, object] = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+    if crs is not None:
+        collection["crs"] = {"type": "name", "properties": {"name": crs}}
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(collection, f, ensure_ascii=False, indent=2)
+
+
+def save_gpkg(features: List[Dict[str, object]], save_path: Path, crs: str | None = None, layer: str = "change_bboxes") -> None:
+    if gpd is None or Polygon is None:
+        raise ImportError("Saving GPKG requires geopandas and shapely. Install them or use --save_geojson.")
+
+    rows = []
+    geometries = []
+    for feature in features:
+        properties = dict(feature["properties"])
+        coordinates = feature["geometry"]["coordinates"][0]
+        geometries.append(Polygon(coordinates))
+        rows.append(properties)
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    geodata = gpd.GeoDataFrame(rows, geometry=geometries, crs=crs)
+    geodata.to_file(save_path, layer=layer, driver="GPKG")
 
 
 def draw_boxes_on_image(
@@ -271,6 +444,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prob_dir", type=str, default=None, help="Directory containing probability maps with matching names.")
     parser.add_argument("--image_dir", type=str, default=None, help="Directory containing original large images.")
     parser.add_argument("--save_vis_dir", type=str, default=None, help="Directory for images with drawn bounding boxes.")
+    parser.add_argument("--tile_image_dir", type=str, default=None, help="Directory containing georeferenced GeoTIFF tiles.")
+    parser.add_argument("--save_geojson", type=str, default=None, help="Save georeferenced bounding boxes for QGIS.")
+    parser.add_argument("--save_gpkg", type=str, default=None, help="Save georeferenced bounding boxes as GeoPackage if geopandas is installed.")
+    parser.add_argument("--gpkg_layer", type=str, default="change_bboxes", help="Layer name used when saving GeoPackage.")
     parser.add_argument("--save_csv", type=str, default="outputs/infer/bboxes.csv")
     parser.add_argument("--save_json", type=str, default="outputs/infer/bboxes.json")
     parser.add_argument("--threshold", type=int, default=127, help="Pixel threshold for binary pred maps in [0,255].")
@@ -286,6 +463,9 @@ def main() -> None:
     prob_dir = Path(args.prob_dir) if args.prob_dir else None
     image_dir = Path(args.image_dir) if args.image_dir else None
     save_vis_dir = Path(args.save_vis_dir) if args.save_vis_dir else None
+    tile_image_dir = Path(args.tile_image_dir) if args.tile_image_dir else None
+    save_geojson_path = Path(args.save_geojson) if args.save_geojson else None
+    save_gpkg_path = Path(args.save_gpkg) if args.save_gpkg else None
     assert pred_dir.exists(), f"Missing pred_dir: {pred_dir}"
     if prob_dir is not None:
         assert prob_dir.exists(), f"Missing prob_dir: {prob_dir}"
@@ -293,8 +473,14 @@ def main() -> None:
         assert image_dir.exists(), f"Missing image_dir: {image_dir}"
     if save_vis_dir is not None:
         assert image_dir is not None, "--save_vis_dir requires --image_dir"
+    if save_geojson_path is not None or save_gpkg_path is not None:
+        assert tile_image_dir is not None, "--save_geojson/--save_gpkg requires --tile_image_dir"
+    if tile_image_dir is not None:
+        assert tile_image_dir.exists(), f"Missing tile_image_dir: {tile_image_dir}"
 
     records: List[BoxRecord] = []
+    geojson_features: List[Dict[str, object]] = []
+    geojson_crs: str | None = None
     pred_paths = sorted(path for path in pred_dir.iterdir() if path.is_file())
     assert pred_paths, f"No prediction files found in {pred_dir}"
 
@@ -319,9 +505,34 @@ def main() -> None:
                 save_path=save_vis_dir / f"{pred_path.stem}_boxes.png",
             )
 
+        if tile_image_dir is not None and save_geojson_path is not None:
+            tile_path = find_geotiff_by_stem(tile_image_dir, pred_path.stem)
+            transform, epsg, tile_shape = read_geotiff_metadata(tile_path)
+            if geojson_crs is None and epsg is not None:
+                geojson_crs = epsg
+            pred_shape = read_grayscale(pred_path).shape
+            for box in boxes:
+                geojson_features.append(
+                    box_to_geojson_feature(
+                        box=box,
+                        pred_shape=pred_shape,
+                        tile_shape=tile_shape,
+                        transform=transform,
+                        tile_path=tile_path,
+                    )
+                )
+
     save_csv(records, Path(args.save_csv))
     save_json(records, Path(args.save_json))
+    if save_geojson_path is not None:
+        save_geojson(geojson_features, save_geojson_path, geojson_crs)
+    if save_gpkg_path is not None:
+        save_gpkg(geojson_features, save_gpkg_path, geojson_crs, args.gpkg_layer)
     print(f"Saved {len(records)} boxes to {args.save_csv} and {args.save_json}")
+    if save_geojson_path is not None:
+        print(f"Saved {len(geojson_features)} georeferenced boxes to {save_geojson_path}")
+    if save_gpkg_path is not None:
+        print(f"Saved {len(geojson_features)} georeferenced boxes to {save_gpkg_path}")
 
 
 if __name__ == "__main__":
