@@ -7,13 +7,17 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-import tifffile
 from PIL import Image, ImageDraw, ImageFont
 
 try:
     import cv2
 except ImportError:
     cv2 = None
+
+try:
+    import tifffile
+except ImportError:
+    tifffile = None
 
 try:
     import geopandas as gpd
@@ -57,6 +61,9 @@ def read_grayscale(path: Path) -> np.ndarray:
 
 
 def read_geotiff_metadata(path: Path) -> Tuple[GeoTransform, str | None, Tuple[int, int]]:
+    if tifffile is None:
+        return read_geotiff_metadata_with_pil(path)
+
     with tifffile.TiffFile(path) as tif:
         page = tif.pages[0]
         tags = page.tags
@@ -92,12 +99,65 @@ def read_geotiff_metadata(path: Path) -> Tuple[GeoTransform, str | None, Tuple[i
         return transform, epsg, (image_height, image_width)
 
 
+def read_geotiff_metadata_with_pil(path: Path) -> Tuple[GeoTransform, str | None, Tuple[int, int]]:
+    with Image.open(path) as image:
+        tags = image.tag_v2
+        image_width, image_height = image.size
+
+        matrix_tag = tags.get(34264)
+        if matrix_tag is not None:
+            matrix = tuple(float(value) for value in matrix_tag)
+            assert len(matrix) == 16, f"Invalid ModelTransformationTag in {path}"
+            transform = GeoTransform(0.0, 0.0, 1.0, 1.0, matrix=matrix)
+        else:
+            scale_tag = tags.get(33550)
+            tiepoint_tag = tags.get(33922)
+            assert scale_tag is not None, f"Missing ModelPixelScaleTag in GeoTIFF: {path}"
+            assert tiepoint_tag is not None, f"Missing ModelTiepointTag in GeoTIFF: {path}"
+
+            scale = tuple(float(value) for value in scale_tag)
+            tiepoint = tuple(float(value) for value in tiepoint_tag)
+            assert len(scale) >= 2, f"Invalid ModelPixelScaleTag in {path}"
+            assert len(tiepoint) >= 6, f"Invalid ModelTiepointTag in {path}"
+
+            transform = GeoTransform(
+                origin_x=tiepoint[3],
+                origin_y=tiepoint[4],
+                pixel_width=abs(scale[0]),
+                pixel_height=abs(scale[1]),
+                tie_col=tiepoint[0],
+                tie_row=tiepoint[1],
+            )
+
+        epsg = read_epsg_from_pil_geokeys(tags)
+        return transform, epsg, (image_height, image_width)
+
+
 def read_epsg_from_geokeys(tags) -> str | None:
     geokey_tag = tags.get("GeoKeyDirectoryTag")
     if geokey_tag is None:
         return None
 
     values = tuple(int(value) for value in geokey_tag.value)
+    if len(values) < 4:
+        return None
+
+    key_count = values[3]
+    entries = values[4 : 4 + key_count * 4]
+    epsg_keys = {3072, 2048}
+    for offset in range(0, len(entries), 4):
+        key_id, tiff_tag_location, count, value_offset = entries[offset : offset + 4]
+        if key_id in epsg_keys and tiff_tag_location == 0 and count == 1 and value_offset > 0:
+            return f"EPSG:{value_offset}"
+    return None
+
+
+def read_epsg_from_pil_geokeys(tags) -> str | None:
+    geokey_tag = tags.get(34735)
+    if geokey_tag is None:
+        return None
+
+    values = tuple(int(value) for value in geokey_tag)
     if len(values) < 4:
         return None
 
