@@ -68,15 +68,30 @@ class BitemporalChangeDataset(Dataset):
         assert normalized, "image_suffix/mask_suffix must contain at least one valid suffix"
         return tuple(dict.fromkeys(normalized))
 
-    def _find_by_stem(self, directory: Path, stem: str, suffixes: tuple[str, ...], label: str) -> Path:
-        matches = [
-            path
-            for path in directory.iterdir()
-            if path.is_file() and path.stem == stem and path.suffix.lower() in suffixes
-        ]
-        assert matches, f"Missing matching {label}: {directory / stem}; supported suffixes: {suffixes}"
-        assert len(matches) == 1, f"Multiple matching {label} files for stem '{stem}': {matches}"
-        return matches[0]
+    # def _find_by_stem(self, directory: Path, stem: str, suffixes: tuple[str, ...], label: str) -> Path:
+    #     matches = [
+    #         path
+    #         for path in directory.iterdir()
+    #         if path.is_file() and path.stem == stem and path.suffix.lower() in suffixes
+    #     ]
+    #     assert matches, f"Missing matching {label}: {directory / stem}; supported suffixes: {suffixes}"
+    #     assert len(matches) == 1, f"Multiple matching {label} files for stem '{stem}': {matches}"
+    #     return matches[0]
+
+    def _find_by_stem(self, directory, stem: str, suffixes: tuple[str, ...], label: str):
+        """极速版：O(1) 复杂度，直接拼接路径，拒绝全量遍历"""
+        found_paths = []
+        
+        # 尝试直接拼接后缀名，一击必中
+        for suffix in suffixes:
+            target_path = directory / f"{stem}{suffix}"
+            if target_path.is_file():
+                found_paths.append(target_path)
+                
+        # 保持你原有的安全校验逻辑
+        assert found_paths, f"Missing matching {label}: {directory / stem}; supported suffixes: {suffixes}"
+        assert len(found_paths) == 1, f"Multiple matching {label} files for stem '{stem}': {found_paths}"
+        return found_paths[0]
 
     def _scan_samples(self) -> List[Dict[str, Path]]:
         assert self.t1_dir.exists(), f"Missing t1 directory: {self.t1_dir}"
