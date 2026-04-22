@@ -26,8 +26,14 @@ except ImportError:
     gpd = None
     Polygon = None
 
+try:
+    from skimage import measure as sk_measure
+except ImportError:
+    sk_measure = None
+
 
 BoxRecord = Dict[str, float | int | str]
+GeoJsonFeature = Dict[str, object]
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 GEOTIFF_SUFFIXES = (".tif", ".tiff")
 
@@ -408,7 +414,234 @@ def box_to_geojson_feature(
     }
 
 
-def save_geojson(features: List[Dict[str, object]], save_path: Path, crs: str | None = None) -> None:
+def contour_to_geojson_feature(
+    contour: np.ndarray,
+    component_id: int,
+    pred_shape: Tuple[int, int],
+    tile_shape: Tuple[int, int],
+    transform: GeoTransform,
+    tile_path: Path,
+    pred_path: Path,
+    prob: np.ndarray | None,
+    min_area: int,
+) -> GeoJsonFeature | None:
+    pred_height, pred_width = pred_shape
+    tile_height, tile_width = tile_shape
+    scale_x = tile_width / pred_width
+    scale_y = tile_height / pred_height
+
+    component_mask = np.zeros(pred_shape, dtype=np.uint8)
+    cv2.drawContours(component_mask, [contour], contourIdx=-1, color=1, thickness=-1)
+    area = int(component_mask.sum())
+    if area < min_area:
+        return None
+
+    points = contour.reshape(-1, 2).astype(np.float64)
+    if len(points) < 3:
+        return None
+
+    ring: List[Tuple[float, float]] = []
+    for col, row in points:
+        tile_col = col * scale_x
+        tile_row = row * scale_y
+        ring.append(transform.pixel_to_map(tile_col, tile_row))
+
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+    if len(ring) < 4:
+        return None
+
+    ys, xs = np.nonzero(component_mask)
+    properties: BoxRecord = {
+        "image": pred_path.name,
+        "stem": pred_path.stem,
+        "tile": tile_path.name,
+        "component_id": component_id,
+        "area": area,
+        "point_count": len(ring) - 1,
+        "source": "contour",
+    }
+    if prob is not None and len(xs) > 0:
+        component_probs = prob[ys, xs].astype(np.float32) / 255.0
+        properties["score"] = float(component_probs.mean())
+        properties["max_score"] = float(component_probs.max())
+
+    return {
+        "type": "Feature",
+        "properties": properties,
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[list(point) for point in ring]],
+        },
+    }
+
+
+def skimage_contour_to_geojson_feature(
+    contour: np.ndarray,
+    component_mask: np.ndarray,
+    component_id: int,
+    pred_shape: Tuple[int, int],
+    tile_shape: Tuple[int, int],
+    transform: GeoTransform,
+    tile_path: Path,
+    pred_path: Path,
+    prob: np.ndarray | None,
+    min_area: int,
+) -> GeoJsonFeature | None:
+    area = int(component_mask.sum())
+    if area < min_area or len(contour) < 3:
+        return None
+
+    pred_height, pred_width = pred_shape
+    tile_height, tile_width = tile_shape
+    scale_x = tile_width / pred_width
+    scale_y = tile_height / pred_height
+
+    ring: List[Tuple[float, float]] = []
+    for row, col in contour:
+        tile_col = float(col) * scale_x
+        tile_row = float(row) * scale_y
+        ring.append(transform.pixel_to_map(tile_col, tile_row))
+
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+    if len(ring) < 4:
+        return None
+
+    ys, xs = np.nonzero(component_mask)
+    properties: BoxRecord = {
+        "image": pred_path.name,
+        "stem": pred_path.stem,
+        "tile": tile_path.name,
+        "component_id": component_id,
+        "area": area,
+        "point_count": len(ring) - 1,
+        "source": "mask_contour",
+    }
+    if prob is not None and len(xs) > 0:
+        component_probs = prob[ys, xs].astype(np.float32) / 255.0
+        properties["score"] = float(component_probs.mean())
+        properties["max_score"] = float(component_probs.max())
+
+    return {
+        "type": "Feature",
+        "properties": properties,
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[list(point) for point in ring]],
+        },
+    }
+
+
+def box_to_polygon_feature(
+    box: BoxRecord,
+    pred_shape: Tuple[int, int],
+    tile_shape: Tuple[int, int],
+    transform: GeoTransform,
+    tile_path: Path,
+) -> GeoJsonFeature:
+    feature = box_to_geojson_feature(box, pred_shape, tile_shape, transform, tile_path)
+    feature["properties"]["source"] = "bbox_fallback"
+    feature["properties"]["point_count"] = 4
+    return feature
+
+
+def mask_to_polygon_features_skimage(
+    binary: np.ndarray,
+    prob: np.ndarray | None,
+    pred_path: Path,
+    tile_path: Path,
+    tile_shape: Tuple[int, int],
+    transform: GeoTransform,
+    min_area: int,
+) -> List[GeoJsonFeature]:
+    assert sk_measure is not None
+    labels = sk_measure.label(binary, connectivity=2)
+    features: List[GeoJsonFeature] = []
+
+    for component_id in range(1, int(labels.max()) + 1):
+        component_mask = labels == component_id
+        if int(component_mask.sum()) < min_area:
+            continue
+
+        padded = np.pad(component_mask.astype(np.float32), pad_width=1, mode="constant", constant_values=0)
+        contours = sk_measure.find_contours(padded, level=0.5)
+        if not contours:
+            continue
+
+        contour = max(contours, key=len) - 1.0
+        feature = skimage_contour_to_geojson_feature(
+            contour=contour,
+            component_mask=component_mask,
+            component_id=component_id,
+            pred_shape=binary.shape,
+            tile_shape=tile_shape,
+            transform=transform,
+            tile_path=tile_path,
+            pred_path=pred_path,
+            prob=prob,
+            min_area=min_area,
+        )
+        if feature is not None:
+            features.append(feature)
+
+    return features
+
+
+def mask_to_polygon_features(
+    pred: np.ndarray,
+    prob: np.ndarray | None,
+    pred_path: Path,
+    tile_path: Path,
+    tile_shape: Tuple[int, int],
+    transform: GeoTransform,
+    threshold: int,
+    min_area: int,
+    simplify_epsilon: float,
+) -> List[GeoJsonFeature]:
+    pred_shape = pred.shape
+    binary = pred > threshold
+
+    if cv2 is None and sk_measure is not None:
+        return mask_to_polygon_features_skimage(
+            binary=binary,
+            prob=prob,
+            pred_path=pred_path,
+            tile_path=tile_path,
+            tile_shape=tile_shape,
+            transform=transform,
+            min_area=min_area,
+        )
+
+    if cv2 is None:
+        boxes = mask_to_boxes(pred=pred, prob=prob, threshold=threshold, min_area=min_area)
+        for box in boxes:
+            box["image"] = pred_path.name
+            box["stem"] = pred_path.stem
+        return [box_to_polygon_feature(box, pred_shape, tile_shape, transform, tile_path) for box in boxes]
+
+    contours, _ = cv2.findContours(binary.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    features: List[GeoJsonFeature] = []
+    for component_id, contour in enumerate(contours, start=1):
+        if simplify_epsilon > 0:
+            contour = cv2.approxPolyDP(contour, epsilon=float(simplify_epsilon), closed=True)
+        feature = contour_to_geojson_feature(
+            contour=contour,
+            component_id=component_id,
+            pred_shape=pred_shape,
+            tile_shape=tile_shape,
+            transform=transform,
+            tile_path=tile_path,
+            pred_path=pred_path,
+            prob=prob,
+            min_area=min_area,
+        )
+        if feature is not None:
+            features.append(feature)
+    return features
+
+
+def save_geojson(features: List[GeoJsonFeature], save_path: Path, crs: str | None = None) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     collection: Dict[str, object] = {
         "type": "FeatureCollection",
@@ -420,7 +653,7 @@ def save_geojson(features: List[Dict[str, object]], save_path: Path, crs: str | 
         json.dump(collection, f, ensure_ascii=False, indent=2)
 
 
-def save_gpkg(features: List[Dict[str, object]], save_path: Path, crs: str | None = None, layer: str = "change_bboxes") -> None:
+def save_gpkg(features: List[GeoJsonFeature], save_path: Path, crs: str | None = None, layer: str = "change_bboxes") -> None:
     if gpd is None or Polygon is None:
         raise ImportError("Saving GPKG requires geopandas and shapely. Install them or use --save_geojson.")
 
@@ -435,6 +668,53 @@ def save_gpkg(features: List[Dict[str, object]], save_path: Path, crs: str | Non
     save_path.parent.mkdir(parents=True, exist_ok=True)
     geodata = gpd.GeoDataFrame(rows, geometry=geometries, crs=crs)
     geodata.to_file(save_path, layer=layer, driver="GPKG")
+
+
+def save_polygon_csv(features: List[GeoJsonFeature], save_path: Path) -> None:
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "image",
+        "stem",
+        "tile",
+        "component_id",
+        "area",
+        "point_count",
+        "score",
+        "max_score",
+        "source",
+    ]
+    with open(save_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for feature in features:
+            writer.writerow(feature["properties"])
+
+
+def save_qgis_polygon_qml(save_path: Path, fill_alpha: int = 90) -> None:
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fill_alpha = max(0, min(255, int(fill_alpha)))
+    qml = f"""<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
+<qgis version="3.28" styleCategories="Symbology">
+  <renderer-v2 type="singleSymbol" symbollevels="0" enableorderby="0" forceraster="0">
+    <symbols>
+      <symbol type="fill" name="0" alpha="1" clip_to_extent="1">
+        <layer class="SimpleFill" enabled="1" pass="0" locked="0">
+          <Option type="Map">
+            <Option name="color" type="QString" value="255,0,0,{fill_alpha}"/>
+            <Option name="outline_color" type="QString" value="255,255,0,255"/>
+            <Option name="outline_width" type="QString" value="0.4"/>
+            <Option name="outline_width_unit" type="QString" value="MM"/>
+            <Option name="style" type="QString" value="solid"/>
+          </Option>
+        </layer>
+      </symbol>
+    </symbols>
+  </renderer-v2>
+  <layerOpacity>1</layerOpacity>
+</qgis>
+"""
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write(qml)
 
 
 def draw_boxes_on_image(
@@ -508,6 +788,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_geojson", type=str, default=None, help="Save georeferenced bounding boxes for QGIS.")
     parser.add_argument("--save_gpkg", type=str, default=None, help="Save georeferenced bounding boxes as GeoPackage if geopandas is installed.")
     parser.add_argument("--gpkg_layer", type=str, default="change_bboxes", help="Layer name used when saving GeoPackage.")
+    parser.add_argument("--save_polygon_geojson", type=str, default=None, help="Save georeferenced mask polygons for QGIS.")
+    parser.add_argument("--save_polygon_gpkg", type=str, default=None, help="Save georeferenced mask polygons as GeoPackage if geopandas is installed.")
+    parser.add_argument("--polygon_gpkg_layer", type=str, default="change_polygons", help="Layer name used for polygon GeoPackage.")
+    parser.add_argument("--save_polygon_csv", type=str, default=None, help="Save polygon attribute statistics as CSV.")
+    parser.add_argument("--save_polygon_qml", type=str, default=None, help="Save QGIS style file for translucent polygon highlight.")
+    parser.add_argument("--polygon_simplify_epsilon", type=float, default=1.0, help="Contour simplification epsilon in pred-map pixels.")
+    parser.add_argument("--polygon_fill_alpha", type=int, default=90, help="QGIS polygon fill alpha in [0,255].")
     parser.add_argument("--save_csv", type=str, default="outputs/infer/bboxes.csv")
     parser.add_argument("--save_json", type=str, default="outputs/infer/bboxes.json")
     parser.add_argument("--threshold", type=int, default=127, help="Pixel threshold for binary pred maps in [0,255].")
@@ -526,6 +813,10 @@ def main() -> None:
     tile_image_dir = Path(args.tile_image_dir) if args.tile_image_dir else None
     save_geojson_path = Path(args.save_geojson) if args.save_geojson else None
     save_gpkg_path = Path(args.save_gpkg) if args.save_gpkg else None
+    save_polygon_geojson_path = Path(args.save_polygon_geojson) if args.save_polygon_geojson else None
+    save_polygon_gpkg_path = Path(args.save_polygon_gpkg) if args.save_polygon_gpkg else None
+    save_polygon_csv_path = Path(args.save_polygon_csv) if args.save_polygon_csv else None
+    save_polygon_qml_path = Path(args.save_polygon_qml) if args.save_polygon_qml else None
     assert pred_dir.exists(), f"Missing pred_dir: {pred_dir}"
     if prob_dir is not None:
         assert prob_dir.exists(), f"Missing prob_dir: {prob_dir}"
@@ -533,13 +824,21 @@ def main() -> None:
         assert image_dir.exists(), f"Missing image_dir: {image_dir}"
     if save_vis_dir is not None:
         assert image_dir is not None, "--save_vis_dir requires --image_dir"
-    if save_geojson_path is not None or save_gpkg_path is not None:
-        assert tile_image_dir is not None, "--save_geojson/--save_gpkg requires --tile_image_dir"
+    geo_outputs = [
+        save_geojson_path,
+        save_gpkg_path,
+        save_polygon_geojson_path,
+        save_polygon_gpkg_path,
+        save_polygon_csv_path,
+    ]
+    if any(path is not None for path in geo_outputs):
+        assert tile_image_dir is not None, "Geo outputs require --tile_image_dir"
     if tile_image_dir is not None:
         assert tile_image_dir.exists(), f"Missing tile_image_dir: {tile_image_dir}"
 
     records: List[BoxRecord] = []
-    geojson_features: List[Dict[str, object]] = []
+    geojson_features: List[GeoJsonFeature] = []
+    polygon_features: List[GeoJsonFeature] = []
     geojson_crs: str | None = None
     pred_paths = sorted(path for path in pred_dir.iterdir() if path.is_file())
     assert pred_paths, f"No prediction files found in {pred_dir}"
@@ -565,20 +864,44 @@ def main() -> None:
                 save_path=save_vis_dir / f"{pred_path.stem}_boxes.png",
             )
 
-        if tile_image_dir is not None and save_geojson_path is not None:
+        if tile_image_dir is not None and any(path is not None for path in geo_outputs):
             tile_path = find_geotiff_by_stem(tile_image_dir, pred_path.stem)
             transform, epsg, tile_shape = read_geotiff_metadata(tile_path)
             if geojson_crs is None and epsg is not None:
                 geojson_crs = epsg
-            pred_shape = read_grayscale(pred_path).shape
-            for box in boxes:
-                geojson_features.append(
-                    box_to_geojson_feature(
-                        box=box,
-                        pred_shape=pred_shape,
+            pred = read_grayscale(pred_path)
+            pred_shape = pred.shape
+
+            if save_geojson_path is not None or save_gpkg_path is not None:
+                for box in boxes:
+                    geojson_features.append(
+                        box_to_geojson_feature(
+                            box=box,
+                            pred_shape=pred_shape,
+                            tile_shape=tile_shape,
+                            transform=transform,
+                            tile_path=tile_path,
+                        )
+                    )
+
+            if save_polygon_geojson_path is not None or save_polygon_gpkg_path is not None or save_polygon_csv_path is not None:
+                prob = None
+                if prob_dir is not None:
+                    prob_path = prob_dir / pred_path.name
+                    assert prob_path.exists(), f"Missing probability map for {pred_path.name}: {prob_path}"
+                    prob = read_grayscale(prob_path)
+                    assert prob.shape == pred.shape, f"prob/pred size mismatch: {prob_path} vs {pred_path}"
+                polygon_features.extend(
+                    mask_to_polygon_features(
+                        pred=pred,
+                        prob=prob,
+                        pred_path=pred_path,
+                        tile_path=tile_path,
                         tile_shape=tile_shape,
                         transform=transform,
-                        tile_path=tile_path,
+                        threshold=int(args.threshold),
+                        min_area=int(args.min_area),
+                        simplify_epsilon=float(args.polygon_simplify_epsilon),
                     )
                 )
 
@@ -588,11 +911,25 @@ def main() -> None:
         save_geojson(geojson_features, save_geojson_path, geojson_crs)
     if save_gpkg_path is not None:
         save_gpkg(geojson_features, save_gpkg_path, geojson_crs, args.gpkg_layer)
+    if save_polygon_geojson_path is not None:
+        save_geojson(polygon_features, save_polygon_geojson_path, geojson_crs)
+    if save_polygon_gpkg_path is not None:
+        save_gpkg(polygon_features, save_polygon_gpkg_path, geojson_crs, args.polygon_gpkg_layer)
+    if save_polygon_csv_path is not None:
+        save_polygon_csv(polygon_features, save_polygon_csv_path)
+    if save_polygon_qml_path is not None:
+        save_qgis_polygon_qml(save_polygon_qml_path, args.polygon_fill_alpha)
     print(f"Saved {len(records)} boxes to {args.save_csv} and {args.save_json}")
     if save_geojson_path is not None:
         print(f"Saved {len(geojson_features)} georeferenced boxes to {save_geojson_path}")
     if save_gpkg_path is not None:
         print(f"Saved {len(geojson_features)} georeferenced boxes to {save_gpkg_path}")
+    if save_polygon_geojson_path is not None:
+        print(f"Saved {len(polygon_features)} georeferenced polygons to {save_polygon_geojson_path}")
+    if save_polygon_gpkg_path is not None:
+        print(f"Saved {len(polygon_features)} georeferenced polygons to {save_polygon_gpkg_path}")
+    if save_polygon_qml_path is not None:
+        print(f"Saved QGIS translucent polygon style to {save_polygon_qml_path}")
 
 
 if __name__ == "__main__":
